@@ -1,0 +1,8 @@
+# LiteLLM Proxy 配置模板
+# 首次启动时由 02-start-platform-components.sh 复制为 /data/aiwork/litellm/config.yaml
+# 模型统一在 LiteLLM 后台管理（STORE_MODEL_IN_DB=True），也可在此追加 model_list
+
+model_list: []
+
+general_settings:
+  store_model_in_db: true

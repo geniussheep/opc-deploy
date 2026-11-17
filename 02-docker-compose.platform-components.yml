@@ -1,0 +1,233 @@
+name: opc-platform
+
+# ==============================================================================
+# OPC 2.0 平台基础支撑组件 (Platform Supporting Services)
+# 镜像地址由 02-platform-components.env 的 IMAGE_* 提供，compose 内保留同值兜底
+# 端口分配:
+#   - 3000: Langfuse LLM 可观测性看板 (Web)
+#   - 3004: LiteLLM 统一大模型路由网关
+#   - 3005: MCP Admin 插件工具管理后台
+#   - 3006: MCP Gateway 协议服务网关
+#   - 8088: opc-paddleocr OCR 服务（容器 8080）
+#   - 内部: opc-clickhouse 8123/9000（Langfuse 专用，不对外映射）
+# ==============================================================================
+
+networks:
+  root_default:
+    external: true
+    name: root_default
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. LiteLLM 模型统一接入网关 (端口: 3004)
+  # ----------------------------------------------------------------------------
+  opc-llm-gateway:
+    image: ${IMAGE_LITELLM:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/litellm/litellm:v1.65.0-stable}
+    container_name: opc-llm-gateway
+    restart: unless-stopped
+    ports:
+      - "${LITELLM_PORT:-3004}:4000"
+    environment:
+      - TZ=Asia/Shanghai
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_SALT_KEY=${LITELLM_SALT_KEY}
+      - UI_USERNAME=${LITELLM_UI_USERNAME:-admin}
+      - UI_PASSWORD=${LITELLM_UI_PASSWORD}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@infra-postgres:5432/litellm
+      - REDIS_HOST=infra-redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - STORE_MODEL_IN_DB=True
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 2. MCP Gateway / MCP Admin 统一网关与管理后台 (端口: 3005 / 3006)
+  #    容器内监听端口:
+  #      - 80:   MCP Admin Web 管理台 (映射宿主机 3005)
+  #      - 5235: MCP Gateway 协议服务 (映射宿主机 3006)
+  # ----------------------------------------------------------------------------
+  opc-mcp-gateway:
+    image: ${IMAGE_MCP_GATEWAY:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/amoylab/unla/allinone:latest-20261112-v1.0}
+    container_name: opc-mcp-gateway
+    restart: unless-stopped
+    ports:
+      - "${MCP_ADMIN_PORT:-3005}:80"
+      - "${MCP_GATEWAY_HOST_PORT:-3006}:5235"
+    environment:
+      - TZ=Asia/Shanghai
+      - ENV=production
+      - APISERVER_JWT_SECRET_KEY=${JWT_SECRET}
+      - SUPER_ADMIN_USERNAME=${MCP_ADMIN_USERNAME:-admin}
+      - SUPER_ADMIN_PASSWORD=${MCP_ADMIN_PASSWORD}
+      - VITE_API_BASE_URL=/mcp-admin/api
+      - VITE_WS_BASE_URL=/mcp-admin/api/ws
+      - VITE_MCP_GATEWAY_BASE_URL=/mcp-gateway
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/mcp-gateway:/app/data
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 3. Langfuse 日志数据库 ClickHouse 24.8
+  # ----------------------------------------------------------------------------
+  opc-clickhouse:
+    image: ${IMAGE_CLICKHOUSE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/clickhouse/clickhouse-server:24.8}
+    container_name: opc-clickhouse
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/clickhouse:/var/lib/clickhouse
+    networks:
+      - root_default
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # 4. Langfuse Web & API (端口: 3000)
+  # ----------------------------------------------------------------------------
+  opc-langfuse-web:
+    image: ${IMAGE_LANGFUSE_WEB:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/langfuse/langfuse:3}
+    container_name: opc-langfuse-web
+    restart: unless-stopped
+    ports:
+      - "${LANGFUSE_WEB_PORT:-3000}:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@infra-postgres:5432/langfuse
+      - NEXTAUTH_URL=https://${MAIN_DOMAIN:-aiwork.benlai.com}/langfuse
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET}
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - TELEMETRY_ENABLED=false
+      - CLICKHOUSE_URL=http://opc-clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://opc-clickhouse:9000
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_CONNECTION_STRING=redis://:${REDIS_PASSWORD}@infra-redis:6379/2
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://infra-minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=https://${MAIN_DOMAIN:-aiwork.benlai.com}
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+      # 首次启动免注册自动初始化项目、API Key 与管理员账号
+      - LANGFUSE_INIT_ORG_ID=${LANGFUSE_INIT_ORG_ID:-opc-org}
+      - LANGFUSE_INIT_ORG_NAME=${LANGFUSE_INIT_ORG_NAME:-OPC Enterprise}
+      - LANGFUSE_INIT_PROJECT_ID=${LANGFUSE_INIT_PROJECT_ID:-opc-project}
+      - LANGFUSE_INIT_PROJECT_NAME=${LANGFUSE_INIT_PROJECT_NAME:-OPC Production}
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-opc-prod-2026}
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      - LANGFUSE_INIT_USER_EMAIL=${LANGFUSE_INIT_USER_EMAIL:-admin@enterprise.com}
+      - LANGFUSE_INIT_USER_NAME=${LANGFUSE_INIT_USER_NAME:-OPC Admin}
+      - LANGFUSE_INIT_USER_PASSWORD=${LANGFUSE_INIT_USER_PASSWORD}
+    depends_on:
+      opc-clickhouse:
+        condition: service_healthy
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 5. Langfuse Worker (异步日志采集处理)
+  # ----------------------------------------------------------------------------
+  opc-langfuse-worker:
+    image: ${IMAGE_LANGFUSE_WORKER:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/langfuse/langfuse-worker:3}
+    container_name: opc-langfuse-worker
+    restart: unless-stopped
+    environment:
+      - TZ=CST-8
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@infra-postgres:5432/langfuse
+      - NEXTAUTH_URL=https://${MAIN_DOMAIN:-aiwork.benlai.com}/langfuse
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET}
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - TELEMETRY_ENABLED=false
+      - CLICKHOUSE_URL=http://opc-clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://opc-clickhouse:9000
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_CONNECTION_STRING=redis://:${REDIS_PASSWORD}@infra-redis:6379/2
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://infra-minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+    depends_on:
+      opc-clickhouse:
+        condition: service_healthy
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 6. 文档解析服务 docreader（gRPC 50051，仅内网）
+  # ----------------------------------------------------------------------------
+  opc-docreader:
+    image: ${IMAGE_DOCREADER:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/wechatopenai/weknora-docreader:latest-20261113-v1.0}
+    container_name: opc-docreader
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - DOCREADER_IMAGE_OUTPUT_DIR=/tmp/docreader
+      - DOCREADER_GRPC_PORT=50051
+    expose:
+      - "50051"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/docreader/tmp:/tmp/docreader
+    networks:
+      root_default:
+        aliases:
+          - opc-docreader
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ----------------------------------------------------------------------------
+  # 7. OCR 服务 paddleocr（宿主机 8088 -> 容器 8080）
+  #    使用测试服务器同款自定义 server.py（PaddleOCR-VL 协议）
+  # ----------------------------------------------------------------------------
+  opc-paddleocr:
+    image: ${IMAGE_PADDLEOCR:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/wechatopenai/weknora-paddleocr:latest-20261113-v1.0}
+    container_name: opc-paddleocr
+    restart: unless-stopped
+    ports:
+      - "${PADDLEOCR_HOST_PORT:-8088}:8080"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/paddleocr/server.py:/app/server.py:ro
+    networks:
+      root_default:
+        aliases:
+          - opc-paddleocr
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

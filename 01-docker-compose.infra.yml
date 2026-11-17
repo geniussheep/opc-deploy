@@ -1,0 +1,176 @@
+name: opc-infra
+
+# ==============================================================================
+# OPC 2.0 基础设施与数据持久底座 (Infrastructure Layer)
+# 镜像地址由 01-infra.env 的 IMAGE_* 提供，compose 内保留同值兜底
+# ==============================================================================
+
+networks:
+  root_default:
+    external: true
+    name: root_default
+
+services:
+  # =========================================================================
+  # 1. 核心关系型与向量数据库 PostgreSQL 16 (对齐测试服务器真实运行镜像)
+  # =========================================================================
+  infra-postgres:
+    image: ${IMAGE_POSTGRES:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/immich-app/postgres:16-vectorchord0.5.3-pgvector0.8.1}
+    container_name: infra-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: weknora
+      TZ: Asia/Shanghai
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/postgres:/var/lib/postgresql/data
+    networks:
+      root_default:
+        aliases:
+          - postgres
+          - db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d weknora"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # =========================================================================
+  # 2. 高性能缓存与流式任务队列 Redis 7.4 (对齐测试服务器)
+  # =========================================================================
+  infra-redis:
+    image: ${IMAGE_REDIS:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/redis:7.4-alpine}
+    container_name: infra-redis
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/redis:/data
+    networks:
+      root_default:
+        aliases:
+          - redis
+
+  # =========================================================================
+  # 3. 分布式 S3 对象存储 MinIO (对齐测试服务器发布版本)
+  # =========================================================================
+  infra-minio:
+    image: ${IMAGE_MINIO:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z}
+    container_name: infra-minio
+    restart: unless-stopped
+    command: server /minio_data --address 0.0.0.0:9000 --console-address 0.0.0.0:9001
+    environment:
+      TZ: CST-8
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_S3_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/minio:/minio_data
+    networks:
+      root_default:
+        aliases:
+          - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # =========================================================================
+  # 4. Milvus 向量元数据存储 Etcd 3.6
+  # =========================================================================
+  infra-etcd:
+    image: ${IMAGE_ETCD:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/registry.k8s.io/etcd:3.6.8-0}
+    container_name: infra-etcd
+    restart: unless-stopped
+    environment:
+      TZ: CST-8
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - -advertise-client-urls=http://infra-etcd:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/etcd:/etcd
+    networks:
+      root_default:
+        aliases:
+          - etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # =========================================================================
+  # 5. 高维向量检索引擎 Milvus (对齐测试服务器 v3.0.1)
+  # =========================================================================
+  infra-milvus:
+    image: ${IMAGE_MILVUS:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/milvusdb/milvus:v3.0.1}
+    container_name: infra-milvus
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      TZ: Asia/Shanghai
+      ETCD_ENDPOINTS: infra-etcd:2379
+      MINIO_ADDRESS: infra-minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MILVUS_LOG_LEVEL: error
+    command: ["milvus", "run", "standalone"]
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/milvus:/var/lib/milvus
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/milvus/logs:/var/lib/milvus/logs
+    depends_on:
+      infra-etcd:
+        condition: service_healthy
+      infra-minio:
+        condition: service_healthy
+    networks:
+      root_default:
+        aliases:
+          - milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 8
+      start_period: 90s
+
+  # =========================================================================
+  # 6. GraphRAG 实体关系图数据库 Neo4j 5.26 (对齐测试服务器 5.26.7)
+  # =========================================================================
+  infra-neo4j:
+    image: ${IMAGE_NEO4J:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/neo4j:5.26.7}
+    container_name: infra-neo4j
+    restart: unless-stopped
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/neo4j/data:/data
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/neo4j/logs:/logs
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/neo4j/import:/var/lib/neo4j/import
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/neo4j/plugins:/var/lib/neo4j/plugins
+    environment:
+      TZ: Asia/Shanghai
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+    networks:
+      root_default:
+        aliases:
+          - neo4j

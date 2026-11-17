@@ -1,0 +1,7 @@
+src/
+*.env
+.DS_Store
+.source.lock
+.source-ready
+.source-prep.*
+.update-sync.*

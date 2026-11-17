@@ -1,0 +1,111 @@
+# ==============================================================================
+# OPC 2.0 平台中枢服务配置 (platform-opc gateway)
+# 对应环境: aiwork-bl 业务服务部署
+# ==============================================================================
+
+server:
+  port: 3002
+  external_base_url: "https://@MAIN_DOMAIN@"
+
+database:
+  host: "infra-postgres"
+  port: 5432
+  user: "postgres"
+  dbname: "weknora"
+  sslmode: "disable"
+
+statedb:
+  host: "infra-postgres"
+  port: 5432
+  user: "postgres"
+  dbname: "weknora_gateway_state"
+  sslmode: "disable"
+
+deploydb:
+  host: "infra-postgres"
+  port: 5432
+  user: "postgres"
+  dbname: "deploy-opc"
+  sslmode: "disable"
+
+wecom:
+  corp_id: ""
+  agent_id: @WECOM_AGENT_ID@
+  secret: ""
+  contact_secret: ""
+  redirect_uri: "https://@MAIN_DOMAIN@/wecom/callback"
+
+weknora:
+  base_url: "https://@MAIN_DOMAIN@"
+  root_tenant_id: 10001
+  default_role: "contributor"
+  leader_role: "admin"
+
+oidc:
+  client_id: "weknora"
+
+admin:
+  # 管理后台 (/admin/api) 写接口 CSRF Origin 白名单
+  allowed_origins:
+    - "https://@MAIN_DOMAIN@"
+    - "http://127.0.0.1:3002"
+    - "http://localhost:3002"
+
+graphql:
+  endpoint: @ACCOUNT_CENTER_GRAPHQL_URL@
+
+minio:
+  endpoint: "infra-minio:9000"
+  bucket_name: "weknora"
+  path_prefix: "weknora/"
+  use_ssl: false
+
+milvus:
+  address: "infra-milvus:19530"
+  collection: "weknora_embeddings"
+
+app_deploy:
+  auto_sync_skill: false
+  knowledge_base_url: "http://knowledge-opc-app:8080"
+  online_resources:
+    - id: "shared-pg-main"
+      name: "企业共享 PostgreSQL"
+      type: "postgres"
+      description: @SHARED_PG_DESC@
+      is_default: true
+      env_vars:
+        DATABASE_URL: @SHARED_PG_DATABASE_URL@
+        PGHOST: @INFRA_HOST_JSON@
+        PGPORT: @POSTGRES_PORT_JSON@
+        PGUSER: @POSTGRES_USER_JSON@
+        PGPASSWORD: @POSTGRES_PASSWORD_JSON@
+        PGDATABASE: "opc_apps"
+        DB_HOST: @INFRA_HOST_JSON@
+        DB_PORT: @POSTGRES_PORT_JSON@
+        DB_USER: @POSTGRES_USER_JSON@
+        DB_PASSWORD: @POSTGRES_PASSWORD_JSON@
+        DB_NAME: "opc_apps"
+    - id: "shared-redis-main"
+      name: "企业共享 Redis"
+      type: "redis"
+      description: @SHARED_REDIS_DESC@
+      is_default: true
+      env_vars:
+        REDIS_HOST: @INFRA_HOST_JSON@
+        REDIS_PORT: @REDIS_PORT_JSON@
+        REDIS_PASSWORD: @REDIS_PASSWORD_JSON@
+        REDIS_URL: @SHARED_REDIS_URL@
+    - id: "shared-oss-minio"
+      name: "企业共享对象存储 (MinIO/OSS)"
+      type: "oss"
+      description: @SHARED_OSS_DESC@
+      is_default: true
+      env_vars:
+        S3_ENDPOINT: @SHARED_S3_ENDPOINT@
+        S3_ACCESS_KEY: @MINIO_ROOT_USER_JSON@
+        S3_SECRET_KEY: @MINIO_ROOT_PASSWORD_JSON@
+        S3_BUCKET: "opc-apps"
+        OSS_ENDPOINT: @SHARED_S3_ENDPOINT@
+        OSS_ACCESS_KEY_ID: @MINIO_ROOT_USER_JSON@
+        OSS_ACCESS_KEY_SECRET: @MINIO_ROOT_PASSWORD_JSON@
+        OSS_BUCKET: "opc-apps"

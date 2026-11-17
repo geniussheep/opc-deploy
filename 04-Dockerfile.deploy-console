@@ -1,0 +1,13 @@
+FROM node:24-bookworm-slim AS build
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+WORKDIR /console
+COPY . .
+RUN npm_config_registry="${NPM_REGISTRY}" npx --yes --package yarn@1.22.22 yarn install --frozen-lockfile --network-timeout 600000 ${NPM_REGISTRY:+--registry="$NPM_REGISTRY"} \
+    && npx --yes --package yarn@1.22.22 yarn build \
+    && test -s build/index.html
+
+FROM nginx:1.31
+COPY --from=build /console/build/ /usr/share/nginx/html/
+COPY --from=build /console/.aiwork-nginx.conf /etc/nginx/templates/default.conf.template
+ENV NGINX_ENVSUBST_FILTER=^DEPLOY_OPC_API_HOST$
+EXPOSE 80

@@ -1,0 +1,173 @@
+name: opc-business
+
+# ==============================================================================
+# OPC 2.0 业务主服务 (Core Business Services)
+# 端口分配:
+#   - 3001: 知识库核心业务后端 (knowledge-opc-app)
+#   - 3002: 平台中枢/企微认证/调度网关 (platform-opc-gateway)
+#   - 3003: 知识库前端 Web 管理控制台 (knowledge-opc-frontend)
+# 网络: 共享 root_default
+# ==============================================================================
+
+networks:
+  root_default:
+    external: true
+    name: root_default
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. 平台中枢与调度网关 (端口: 3002)
+  # ----------------------------------------------------------------------------
+  platform-opc-gateway:
+    image: ${IMAGE_PLATFORM_OPC:?请通过 03 启动脚本加载制品清单}
+    container_name: platform-opc-gateway
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "${PLATFORM_GATEWAY_PORT:-3002}:3002"
+    environment:
+      - TZ=Asia/Shanghai
+      # 服务端外部可达基准 URL 与强制安全签名密钥
+      - EXTERNAL_BASE_URL=https://${MAIN_DOMAIN:-aiwork.benlai.com}
+      - PLATFORM_ADMIN_KEY=${PLATFORM_ADMIN_KEY}
+      - PLATFORM_AUTH_KEY=${PLATFORM_AUTH_KEY}
+      - PLATFORM_BRIDGE_KEY=${PLATFORM_BRIDGE_KEY:-${JWT_SECRET:?请提供 JWT_SECRET}}
+      - PLATFORM_SERVICE_TOKEN=${PLATFORM_SERVICE_TOKEN:-}
+      - SYSTEM_AES_KEY=${SYSTEM_AES_KEY}
+      # OIDC 单点登录凭据
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-weknora}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      # 三套独立数据库连接 (接入 01-infra.env 定义的 postgres)
+      - DB_HOST=infra-postgres
+      - DB_USER=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=weknora
+      - STATE_DB_HOST=infra-postgres
+      - STATE_DB_PORT=5432
+      - STATE_DB_USER=${POSTGRES_USER:-postgres}
+      - STATE_DB_PASSWORD=${POSTGRES_PASSWORD}
+      - STATE_DB_NAME=weknora_gateway_state
+      - STATE_DB_SSLMODE=disable
+      - DEPLOY_DB_HOST=infra-postgres
+      - DEPLOY_DB_PORT=5432
+      - DEPLOY_DB_USER=${POSTGRES_USER:-postgres}
+      - DEPLOY_DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DEPLOY_DB_NAME=deploy-opc
+      - DEPLOY_DB_SSLMODE=disable
+      # 企业微信认证与同步配置
+      - WECOM_CORP_ID=${WECOM_CORP_ID:-}
+      - WECOM_SECRET=${WECOM_APP_SECRET:-}
+      - WECOM_CONTACT_SECRET=${WECOM_CONTACT_SECRET:-}
+      - WECOM_TOKEN=${WECOM_TOKEN:-}
+      - WECOM_ENCODING_AES_KEY=${WECOM_ENCODING_AES_KEY:-}
+      # 知识库后端与动态部署引擎 (CapRover 3008 端口) 对接配置
+      - WEKNORA_BASE_URL=https://${MAIN_DOMAIN}
+      - WEKNORA_JWT_SECRET=${JWT_SECRET}
+      - APP_DEPLOY_INTRANET_ROOT_DOMAIN=${APP_ROOT_DOMAIN}
+      - APP_DEPLOY_CAPROVER_URL=${DEPLOY_OPC_URL:?请通过 03 脚本设置 04 管理地址}
+      - APP_DEPLOY_CAPROVER_PASSWORD=${CAPROVER_PASSWORD}
+      - APP_DEPLOY_KNOWLEDGE_BASE_URL=http://knowledge-opc-app:8080
+      - APP_DEPLOY_KNOWLEDGE_ADMIN_TOKEN=${WEKNORA_API_KEY:-}
+      # 对象存储与向量库连接 (与 knowledge-opc 共享 weknora 存储桶；应用产物使用 opc-apps 存储桶)
+      - MINIO_ENDPOINT=infra-minio:9000
+      - MINIO_BUCKET_NAME=weknora
+      - MINIO_PATH_PREFIX=weknora/
+      - MINIO_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_USE_SSL=false
+      - S3_ENDPOINT=http://infra-minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET=opc-apps
+      - MILVUS_ADDRESS=infra-milvus:19530
+    volumes:
+      - ${PLATFORM_CONFIG_PATH:?请通过 03 启动脚本准备 Platform 配置}:/app/config.yaml:ro
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 2. 知识库核心业务后端 (端口: 3001)
+  # ----------------------------------------------------------------------------
+  knowledge-opc-app:
+    image: ${IMAGE_KNOWLEDGE_APP:?请通过 03 启动脚本加载制品清单}
+    container_name: knowledge-opc-app
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "${KNOWLEDGE_APP_PORT:-3001}:8080"
+    environment:
+      - GIN_MODE=release
+      - TZ=Asia/Shanghai
+      - AUTO_MIGRATE=true
+      - AUTO_RECOVER_DIRTY=false
+      # 数据库与缓存配置
+      - DB_DRIVER=postgres
+      - DB_HOST=infra-postgres
+      - DB_PORT=5432
+      - DB_USER=${POSTGRES_USER:-postgres}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=weknora
+      - REDIS_ADDR=infra-redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # MinIO 对象存储配置
+      - STORAGE_TYPE=minio
+      - MINIO_ENDPOINT=infra-minio:9000
+      - MINIO_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_BUCKET_NAME=weknora
+      - MINIO_USE_SSL=false
+      # 向量检索、图数据库与文档解析 (默认 milvus)
+      - RETRIEVE_DRIVER=${RETRIEVE_DRIVER:-milvus}
+      - MILVUS_ADDRESS=infra-milvus:19530
+      - MILVUS_COLLECTION=weknora_embeddings
+      - NEO4J_ENABLE=true
+      - NEO4J_URI=bolt://infra-neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - DOCREADER_ADDR=opc-docreader:50051
+      - DOCREADER_TRANSPORT=grpc
+      - SSRF_WHITELIST_EXTRA=infra-minio,infra-milvus,infra-neo4j,opc-docreader,opc-llm-gateway,opc-paddleocr,opc-mcp-gateway,opc-langfuse-web${KNOWLEDGE_OIDC_SSRF_HOSTS:-}
+      # 认证、加密与 OIDC 单点登录配置
+      - JWT_SECRET=${JWT_SECRET}
+      - SYSTEM_AES_KEY=${SYSTEM_AES_KEY}
+      - WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL=${WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL:-}
+      - OIDC_AUTH_ENABLE=${KNOWLEDGE_OIDC_ENABLED:-false}
+      - OIDC_AUTH_CLIENT_ID=${OIDC_CLIENT_ID:-weknora}
+      - OIDC_AUTH_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_AUTH_AUTHORIZATION_ENDPOINT=https://${MAIN_DOMAIN:-aiwork.benlai.com}/oidc/authorize
+      - OIDC_AUTH_TOKEN_ENDPOINT=http://platform-opc-gateway:3002/oidc/token
+      - OIDC_AUTH_USER_INFO_ENDPOINT=http://platform-opc-gateway:3002/oidc/userinfo
+      # Langfuse 可观测性上报配置
+      - LANGFUSE_ENABLED=true
+      - LANGFUSE_HOST=http://opc-langfuse-web:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:?请提供 Langfuse 公钥}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:?请提供 Langfuse 密钥}
+    volumes:
+      - ${AIWORK_DATA_DIR:-/data/aiwork}/knowledge/files:/data/files
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - root_default
+
+  # ----------------------------------------------------------------------------
+  # 3. 知识库前端 Web 管理控制台 (端口: 3003)
+  # ----------------------------------------------------------------------------
+  knowledge-opc-frontend:
+    image: ${IMAGE_KNOWLEDGE_UI:?请通过 03 启动脚本加载制品清单}
+    labels:
+      com.aiwork.knowledge-upstream: ${KNOWLEDGE_UPSTREAM_ID:-pending}
+    container_name: knowledge-opc-frontend
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "${KNOWLEDGE_FRONTEND_PORT:-3003}:80"
+    environment:
+      - TZ=Asia/Shanghai
+      - MAX_FILE_SIZE_MB=50
+      - MAX_SKILL_BUNDLE_SIZE_MB=256
+      - APP_HOST=knowledge-opc-app
+      - APP_PORT=8080
+      - APP_SCHEME=http
+    networks:
+      - root_default
