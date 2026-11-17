@@ -119,8 +119,10 @@ jq -s '{images: (map({(.image | split(":")[0]): .}) | add)}' "$BUILD_DIR/"*.json
 mv -f -- "$pending" "$MANIFEST"
 
 load_manifest
-PLATFORM_CONFIG_PATH="$STATE_DIR/config.platform-opc.yaml"
-export PLATFORM_CONFIG_PATH
+
+account_center_url="$(setting ACCOUNT_CENTER_GRAPHQL_URL)"
+wecom_agent_id="$(setting WECOM_AGENT_ID)"
+[[ -z "$wecom_agent_id" || "$wecom_agent_id" =~ ^[0-9]+$ ]] || fail "WECOM_AGENT_ID 须为非负整数"
 
 yaml_quote() {
   jq -Rr '@json' <<< "$1"
@@ -131,53 +133,104 @@ url_encode() {
 }
 
 resolve_infra_host() {
-  local service="$1" ip
-  ip="$(docker inspect -f '{{range $net, $cfg := .NetworkSettings.Networks}}{{if eq $net "aiwork_net"}}{{$cfg.IPAddress}}{{end}}{{end}}' "$service" 2>/dev/null)" || true
-  [[ -n "$ip" ]] || fail "基础设施容器 $service 未加入 aiwork_net，请检查 01 和 02"
-  printf '%s' "$ip"
+  local host target_ip route_out
+  host="$(setting INFRA_HOST)"
+  if [[ -n "${host//[[:space:]]/}" ]]; then
+    printf '%s' "$host"
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    target_ip="$DEPLOY_OPC_HOST"
+    if [[ ! "$target_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && command -v getent >/dev/null 2>&1; then
+      target_ip="$(getent ahostsv4 "$DEPLOY_OPC_HOST" 2>/dev/null | awk 'NR==1{print $1}')"
+      target_ip="${target_ip:-$DEPLOY_OPC_HOST}"
+    fi
+    route_out="$(ip -4 route get "$target_ip" 2>/dev/null || true)"
+    host="$(awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' <<< "$route_out")"
+  fi
+  if [[ -z "${host//[[:space:]]/}" ]] && command -v hostname >/dev/null 2>&1; then
+    host="$(hostname -I 2>/dev/null | awk '
+      {
+        fallback = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^127\./ || $i ~ /:/) continue
+          if ($i !~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) { print $i; exit }
+          if (fallback == "") fallback = $i
+        }
+        if (fallback != "") print fallback
+      }
+    ')"
+  fi
+  [[ -n "${host//[[:space:]]/}" && "$host" != 127.* && "$host" != 0.0.0.0 ]] ||
+    fail "无法自动识别本机内网 IP，请在 03-business.env 填写 INFRA_HOST"
+  printf '%s' "$host"
 }
 
-if (( want_platform )); then
-  local_pg_host="$(resolve_infra_host aiwork-postgres)"
-  local_redis_host="$(resolve_infra_host aiwork-redis)"
-  platform_dsn="postgres://${POSTGRES_USER}:$(url_encode "$POSTGRES_PASSWORD")@${local_pg_host}:5432/platform_opc?sslmode=disable"
-  redis_addr="${local_redis_host}:6379"
-  tmp_cfg="$(mktemp "$STATE_DIR/.config.platform.XXXXXX")"
-  awk \
-    -v port="$(yaml_quote "$PLATFORM_GATEWAY_PORT")" \
-    -v dsn="$(yaml_quote "$platform_dsn")" \
-    -v redis_addr="$(yaml_quote "$redis_addr")" \
-    -v redis_pw="$(yaml_quote "$REDIS_PASSWORD")" \
-    -v admin_key="$(yaml_quote "$PLATFORM_ADMIN_KEY")" \
-    -v auth_key="$(yaml_quote "$PLATFORM_AUTH_KEY")" \
-    -v bridge_key="$(yaml_quote "$PLATFORM_BRIDGE_KEY")" \
-    -v oidc_secret="$(yaml_quote "$OIDC_CLIENT_SECRET")" \
-    -v app_root="$(yaml_quote "$APP_ROOT_DOMAIN")" \
-    -v deploy_url="$(yaml_quote "$DEPLOY_API_URL")" \
-    -v deploy_token="$(yaml_quote "$DEPLOY_API_TOKEN")" \
-    '
-    {
-      gsub(/__PORT__/, port)
-      gsub(/__POSTGRES_DSN__/, dsn)
-      gsub(/__REDIS_ADDR__/, redis_addr)
-      gsub(/__REDIS_PASSWORD__/, redis_pw)
-      gsub(/__PLATFORM_ADMIN_KEY__/, admin_key)
-      gsub(/__PLATFORM_AUTH_KEY__/, auth_key)
-      gsub(/__PLATFORM_BRIDGE_KEY__/, bridge_key)
-      gsub(/__OIDC_CLIENT_SECRET__/, oidc_secret)
-      gsub(/__APP_ROOT_DOMAIN__/, app_root)
-      gsub(/__DEPLOY_API_URL__/, deploy_url)
-      gsub(/__DEPLOY_API_TOKEN__/, deploy_token)
-      print
-    }
-    ' "$SCRIPT_DIR/03-config.platform-opc.yaml" > "$tmp_cfg"
-  chmod 0600 "$tmp_cfg"
-  mv -f -- "$tmp_cfg" "$PLATFORM_CONFIG_PATH"
-fi
+prepare_platform_config() {
+  local candidate checksum infra_host="" pg_user_enc pg_pass_enc redis_pass_enc
+  [[ -s "$CONFIG_PLATFORM_FILE" ]] || fail "Platform 配置模板不存在或为空"
+  if grep -Eq '@(INFRA_HOST_JSON|SHARED_PG_.*|SHARED_REDIS_.*|SHARED_OSS_.*|SHARED_S3_.*|POSTGRES_.*_JSON|REDIS_.*_JSON|MINIO_.*_JSON)@' "$CONFIG_PLATFORM_FILE"; then
+    infra_host="$(resolve_infra_host)"
+  fi
+  pg_user_enc="$(url_encode "$POSTGRES_USER")"
+  pg_pass_enc="$(url_encode "$POSTGRES_PASSWORD")"
+  redis_pass_enc="$(url_encode "$REDIS_PASSWORD")"
 
-compose() {
-  docker compose --project-directory "$SCRIPT_DIR" -f "$COMPOSE_FILE" "$@"
+  mkdir -p -- "$STATE_DIR/platform-config" "$DATA_DIR/knowledge/files"
+  chmod 700 "$STATE_DIR/platform-config"
+  candidate="$(mktemp "$STATE_DIR/platform-config/.config.XXXXXX")"
+  chmod 600 "$candidate"
+  (
+    export \
+      AIW_T0="@MAIN_DOMAIN@"               AIW_V0="$MAIN_DOMAIN" \
+      AIW_T1="@WECOM_AGENT_ID@"            AIW_V1="${wecom_agent_id:-0}" \
+      AIW_T2="@ACCOUNT_CENTER_GRAPHQL_URL@" AIW_V2="$(yaml_quote "$account_center_url")" \
+      AIW_T3="@INFRA_HOST_JSON@"           AIW_V3="$(yaml_quote "$infra_host")" \
+      AIW_T4="@POSTGRES_PORT_JSON@"        AIW_V4="$(yaml_quote "$POSTGRES_PORT")" \
+      AIW_T5="@POSTGRES_USER_JSON@"        AIW_V5="$(yaml_quote "$POSTGRES_USER")" \
+      AIW_T6="@POSTGRES_PASSWORD_JSON@"    AIW_V6="$(yaml_quote "$POSTGRES_PASSWORD")" \
+      AIW_T7="@REDIS_PORT_JSON@"           AIW_V7="$(yaml_quote "$REDIS_PORT")" \
+      AIW_T8="@REDIS_PASSWORD_JSON@"       AIW_V8="$(yaml_quote "$REDIS_PASSWORD")" \
+      AIW_T9="@MINIO_ROOT_USER_JSON@"      AIW_V9="$(yaml_quote "$MINIO_ROOT_USER")" \
+      AIW_T10="@MINIO_ROOT_PASSWORD_JSON@" AIW_V10="$(yaml_quote "$MINIO_ROOT_PASSWORD")" \
+      AIW_T11="@SHARED_PG_DESC@"           AIW_V11="$(yaml_quote "共享 PostgreSQL 数据库服务 (${infra_host}:${POSTGRES_PORT})")" \
+      AIW_T12="@SHARED_PG_DATABASE_URL@"   AIW_V12="$(yaml_quote "postgresql://${pg_user_enc}:${pg_pass_enc}@${infra_host}:${POSTGRES_PORT}/opc_apps?sslmode=disable")" \
+      AIW_T13="@SHARED_REDIS_DESC@"        AIW_V13="$(yaml_quote "共享 Redis 缓存服务 (${infra_host}:${REDIS_PORT})")" \
+      AIW_T14="@SHARED_REDIS_URL@"         AIW_V14="$(yaml_quote "redis://:${redis_pass_enc}@${infra_host}:${REDIS_PORT}/0")" \
+      AIW_T15="@SHARED_OSS_DESC@"          AIW_V15="$(yaml_quote "共享 S3/MinIO 对象存储服务 (http://${infra_host}:${MINIO_S3_PORT})")" \
+      AIW_T16="@SHARED_S3_ENDPOINT@"       AIW_V16="$(yaml_quote "http://${infra_host}:${MINIO_S3_PORT}")" \
+      AIW_N=17
+    exec awk '
+      BEGIN {
+        n = ENVIRON["AIW_N"] + 0
+        for (i = 0; i < n; i++) {
+          tok[i] = ENVIRON["AIW_T" i]
+          val[i] = ENVIRON["AIW_V" i]
+          tlen[i] = length(tok[i])
+        }
+      }
+      {
+        line = $0
+        for (i = 0; i < n; i++) {
+          if (tlen[i] == 0) continue
+          out = ""
+          while ((pos = index(line, tok[i])) > 0) {
+            out = out substr(line, 1, pos - 1) val[i]
+            line = substr(line, pos + tlen[i])
+          }
+          line = out line
+        }
+        print line
+      }
+    ' "$CONFIG_PLATFORM_FILE"
+  ) > "$candidate"
+  checksum="$(sha256sum "$candidate" | awk '{print $1}')"
+  PLATFORM_CONFIG_PATH="$STATE_DIR/platform-config/$checksum.yaml"
+  mv -f -- "$candidate" "$PLATFORM_CONFIG_PATH"
+  export PLATFORM_CONFIG_PATH
 }
+
+prepare_platform_config
 
 json_health() {
   http_200 "$1" | jq -e '.status == "ok"' >/dev/null 2>&1
@@ -204,8 +257,8 @@ if (( want_k_ui || want_k_app )); then
   printf '[INFO] 更新 knowledge-opc-frontend -> %s ...\n' "$IMAGE_KNOWLEDGE_UI"
   compose up -d --no-deps --force-recreate knowledge-opc-frontend
   verify_front() {
-    http_200 "http://127.0.0.1:$KNOWLEDGE_WEB_PORT/" >/dev/null 2>&1 &&
-      http_200 "http://127.0.0.1:$KNOWLEDGE_WEB_PORT/api/v1/system/info" | jq -e '.success == true' >/dev/null 2>&1
+    http_200 "http://127.0.0.1:$KNOWLEDGE_FRONTEND_PORT/" >/dev/null 2>&1 &&
+      http_200 "http://127.0.0.1:$KNOWLEDGE_FRONTEND_PORT/api/v1/system/info" | jq -e '.success == true' >/dev/null 2>&1
   }
   wait_for "Knowledge 前端" verify_front
   printf '[OK] Knowledge 前端及代理健康检查通过\n'
@@ -224,5 +277,6 @@ mv -f -- "$receipt" "$STATE_DIR/active-release.json"
 printf '[OK] 业务增量更新完成。当前清单: %s\n' "$STATE_DIR/active-release.json"
 
 if [[ "$verify_deploy" == true ]]; then
+  exec 9>&-
   exec bash "$SCRIPT_DIR/03-start-business.sh" --verify-deploy
 fi

@@ -76,7 +76,7 @@ if (( need_swarm )) && [[ -z "$swarm_target" ]]; then
 fi
 
 for target in ${business_target:+"$business_target"} ${swarm_target:+"$swarm_target"}; do
-  [[ "$target" =~ ^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]] || fail "SSH 目标必须为 账号@主机: $target"
+  [[ "$target" =~ ^[A-Za-z0-9_.-]+(@[A-Za-z0-9_.-]+)?$ ]] || fail "SSH 目标格式无效: $target"
   ssh "$target" 'test -w /data/aiwork-bl && command -v rsync >/dev/null && command -v flock >/dev/null' ||
     fail "无法准备 $target，请检查 SSH、/data/aiwork-bl 写权限、rsync 和 flock"
 done
@@ -86,7 +86,8 @@ trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/src"
 
 clone_repo() {
-  local repo="$1" dest="$stage/src/$repo"
+  local repo="$1"
+  local dest="$stage/src/$repo"
   printf '[INFO] 拉取 %s (%s)...\n' "$repo" "$git_ref"
   git init --quiet "$dest"
   git -C "$dest" fetch --quiet --depth 1 "https://github.com/shtokendance/$repo.git" "$git_ref"
