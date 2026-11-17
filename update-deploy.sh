@@ -105,15 +105,17 @@ mv -f -- "$pending" "$MANIFEST"
 
 load_manifest
 
+deploy_service="$(jq -r '.service // empty' "$STATE_DIR/active-release.json" 2>/dev/null || true)"
+[[ -n "$deploy_service" ]] || deploy_service="$(docker service ls --filter name=deploy-opc --format '{{.Name}}' | grep -Fx 'deploy-opc' || true)"
+[[ -n "$deploy_service" ]] || deploy_service="captain-captain"
+console_service="$(jq -r '.console_service // "deploy-opc-console"' "$STATE_DIR/active-release.json" 2>/dev/null || echo deploy-opc-console)"
+
 if (( want_deploy )); then
-  deploy_service="$(docker service ls --filter label=aiwork.role=deploy-opc --format '{{.Name}}' | head -n1)"
-  [[ -n "$deploy_service" ]] || deploy_service="captain-captain"
   printf '[INFO] 更新 Swarm 服务 %s -> %s ...\n' "$deploy_service" "$IMAGE_DEPLOY_OPC"
   docker service update --force --image "$IMAGE_DEPLOY_OPC" "$deploy_service"
 fi
 
 if (( want_console )); then
-  console_service="$(jq -r '.console_service // "deploy-opc-console"' "$STATE_DIR/active-release.json" 2>/dev/null || echo deploy-opc-console)"
   printf '[INFO] 更新 Swarm 服务 %s -> %s ...\n' "$console_service" "$IMAGE_DEPLOY_OPC_CONSOLE"
   docker service update --force --image "$IMAGE_DEPLOY_OPC_CONSOLE" "$console_service"
 fi
@@ -122,6 +124,7 @@ if [[ -f "$STATE_DIR/active-release.json" ]]; then
   cp -- "$STATE_DIR/active-release.json" "$STATE_DIR/previous-release.json"
 fi
 jq --arg verifiedAt "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-  '. + {verified_at:$verifiedAt}' "$MANIFEST" > "$STATE_DIR/.active-release.new"
+  --arg service "$deploy_service" --arg consoleService "$console_service" \
+  '. + {verified_at:$verifiedAt, service:$service, console_service:$consoleService}' "$MANIFEST" > "$STATE_DIR/.active-release.new"
 mv -f -- "$STATE_DIR/.active-release.new" "$STATE_DIR/active-release.json"
 printf '[OK] Swarm 增量更新完成。当前清单: %s\n' "$STATE_DIR/active-release.json"
