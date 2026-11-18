@@ -270,6 +270,28 @@ verify_nginx_route() {
   [[ -n "$direct" && "$direct" == "$proxied" ]]
 }
 
+ensure_volume_roots() {
+  local roots current_env update_args=() root
+  roots="$(setting OPC_APP_VOLUME_ROOTS)"
+  [[ -n "${roots//[[:space:]]/}" ]] || return 0
+  current_env="$(docker service inspect --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' "$DEPLOY_SERVICE" | awk -F= '$1=="OPC_APP_VOLUME_ROOTS"{print substr($0, index($0,"=")+1); exit}')"
+  if [[ "$current_env" != "$roots" ]]; then
+    update_args+=(--env-add "OPC_APP_VOLUME_ROOTS=$roots")
+  fi
+  IFS=',' read -r -a root_list <<< "$roots"
+  for root in "${root_list[@]}"; do
+    [[ -n "$root" ]] || continue
+    [[ -d "$root" ]] || fail "OPC_APP_VOLUME_ROOTS 中的目录不存在: $root"
+    if ! docker service inspect --format '{{json .Spec.TaskTemplate.ContainerSpec.Mounts}}' "$DEPLOY_SERVICE" |
+        jq -e --arg p "$root" 'any(.[]; .Type == "bind" and .Source == $p and .Target == $p and (.ReadOnly // false | not))' >/dev/null; then
+      update_args+=(--mount-add "type=bind,source=$root,target=$root")
+    fi
+  done
+  if (( ${#update_args[@]} > 0 )); then
+    timeout "$READY_TIMEOUT" docker service update --update-order stop-first "${update_args[@]}" "$DEPLOY_SERVICE" >/dev/null
+  fi
+}
+
 start_deploy_swarm() {
   local previous
   ADMIN_URL="http://127.0.0.1:$DEPLOY_OPC_ADMIN_PORT"
@@ -295,6 +317,7 @@ start_deploy_swarm() {
         --image "$IMAGE_DEPLOY_OPC" "$DEPLOY_SERVICE" >/dev/null
     fi
   fi
+  ensure_volume_roots
   verify_existing_deploy
   wait_for "$DEPLOY_SERVICE 管理 API" deploy_ready
   finalize_deploy_password
